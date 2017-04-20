@@ -1,22 +1,26 @@
+# coding=UTF8
 """
 Settings file for email responder
 """
-# coding=UTF8
 import logging
 import os
 # __file__ refers to the file settings.py
 CONFIG = {
     'LANG': 'fa',
     'APP_PATH': os.path.dirname(os.path.abspath(__file__)),   # refers to application_top
-    'MAX_ATTACHMENT_SIZE': 4500000,    # max size in bytes of attachment
-    'LOG_LEVEL': logging.ERROR,
+    'MAX_ATTACHMENT_SIZE': 7500000,    # max size in bytes of attachment
+    'LOG_LEVEL': logging.INFO,
     'SOURCE_APP': '',
     'API_KEY_ID': '',
     'SECRET_KEY': '',
     'CONF_S3_BUCKET': '',
     'CONF_S3_KEY': '',
+    'NEWS_BUCKET': '',
+    'NEWS_FILENAME': '',
     'START_EMAIL': '',
+    'NEWS_EMAIL': '',
     'REPLY_EMAIL': '',
+    'FEEDBACK_EMAIL': '',
     'EMAIL_SUBJECT': '',
     'TEMPLATES': {
         'TEXT_BODY': {

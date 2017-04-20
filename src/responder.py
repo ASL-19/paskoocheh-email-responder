@@ -28,8 +28,66 @@ def parse_ses_notification(ses_notification):
         raise ValidationError("Email contains virus.")
 
     source_email = ses_notification["mail"]["source"]
-    recipient = ses_notification["mail"]["destination"][0]
+    recipient = ses_notification["mail"]["destination"][0].lower()
     return (source_email, recipient)
+
+def compose_start_html(pb_config):
+    """ Compose START_EMAIL html
+
+    Args:
+        pb_config: parsed Proto Buffer config file
+    Returns:
+        HTML to include in the response
+    """
+    html = u"<html>"
+    html += CONFIG["TEMPLATES"]["BIA_HTML"]["style"]
+    html += CONFIG["TEMPLATES"]["BIA_HTML"]["body_top"]
+
+    html += "<tr>"
+    html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_header"].format(platform_name = "Tools")
+
+    Tools = {}
+    for platform in pb_config.platforms:
+        if not platform.tools or len(platform.tools) == 0:
+            continue
+        html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_header"] \
+            .format(platform_name = paskoocheh.PlatformName.Name(platform.name).title())
+        platname = paskoocheh.PlatformName.Name(platform.name).title()
+        for tool in platform.tools:
+            if not tool.contact.name in Tools:
+                Tools[tool.contact.name] = {}
+            Tools[tool.contact.name][platname] = tool.contact.mail_responder_email
+    html += "</tr>"
+
+    for toolname, platforms in Tools.items():
+        html += "<tr>"
+        html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_first_column"] \
+                .format(tool_name = toolname)
+        for platform in pb_config.platforms:
+            if not platform.tools or len(platform.tools) == 0:
+                continue
+            platname = paskoocheh.PlatformName.Name(platform.name).title()
+            if platname in platforms:
+                toollink = CONFIG["TEMPLATES"]["BIA_HTML"]["table_tool_link"]. \
+                           format(tool_maillink = platforms[platname])
+            else:
+                toollink = ""
+            html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_cell"] \
+                     .format(tool_link = toollink)
+        html += "</tr>"
+
+    html += CONFIG["TEMPLATES"]["BIA_HTML"]["body_bottom"]
+    return html
+
+def get_news_html():
+
+    try:
+        s3_resource = boto3.resource("s3")
+        email_body = s3_resource.Object(CONFIG["NEWS_BUCKET"], CONFIG["NEWS_FILENAME"]).get()['Body'].read()
+    except ClientError as error:
+        LOGGER.error("Error getting file to attach: %s", str(error))
+
+    return email_body
 
 def get_requested_file_config(recipient_email):
     """ Get file requested from email destination
@@ -39,11 +97,21 @@ def get_requested_file_config(recipient_email):
     Returns:
         matching configuration object from json file
     """
-    if recipient_email == CONFIG["START_EMAIL"]:
-        return None
     pb_file = storage.get_binary_contents(CONFIG["CONF_S3_BUCKET"], CONFIG["CONF_S3_KEY"])
     pb_config = paskoocheh.Config()
     pb_config.ParseFromString(pb_file["Body"].read())
+
+    if recipient_email == CONFIG["START_EMAIL"]:
+        return {
+            "html": compose_start_html(pb_config)
+        }
+    elif recipient_email == CONFIG["REPLY_EMAIL"]:
+        return {}
+    elif recipient_email == CONFIG["NEWS_EMAIL"]:
+        return {
+            "html": get_news_html()
+        }
+
     found_tool = None
     for platform in pb_config.platforms:
         for tool in platform.tools:
@@ -124,31 +192,25 @@ def mail_responder(event, _):
 
     (source_email, recipient) = parse_ses_notification(event["Records"][0]["ses"])
 
-    if recipient == CONFIG["START_EMAIL"]:
-        feedback.send_email(CONFIG["REPLY_EMAIL"], source_email,
-                            CONFIG["EMAIL_SUBJECT"], CONFIG["TEMPLATES"]["BIA_TEXT"][LANG],
-                            CONFIG["TEMPLATES"]["BIA_HTML"][LANG], "",
-                            None)
-        return True
+    if recipient != CONFIG["START_EMAIL"] and recipient != CONFIG["NEWS_EMAIL"]:
+        if actionlog.is_limit_exceeded(source_email, recipient.split("@")[0]):
+            LOGGER.error("Rate limit exceeded for email:%s requested file:%s, Exiting",
+                         source_email, recipient.split("@")[0])
+            return False
 
-    if actionlog.is_limit_exceeded(source_email, recipient.split("@")[0]):
-        LOGGER.error("Rate limit exceeded for email:%s requested file:%s, Exiting",
-                     source_email, recipient.split("@")[0])
-        return False
-
-    requested_file = get_requested_file_config(recipient)
+    response = get_response_from_config(recipient)
 
     # special case for bia@ address
-    if not requested_file:
+    if not response:
         # no file available, error
         LOGGER.error("No attachment defined in configuration file")
         return False
     else:
-        file_bucket = requested_file["bucket"]
-        file_key = requested_file["key"]
-        file_name = requested_file["file_name"]
-        release_url = requested_file["release_url"]
-        tool_name = requested_file["tool_name"]
+        file_bucket = response["bucket"]
+        file_key = response["key"]
+        file_name = response["file_name"]
+        release_url = response["release_url"]
+        tool_name = response["tool_name"]
 
     (text_body, html_body, file_data) = get_attachment(file_bucket, file_key, file_name, tool_name, release_url)
 
@@ -158,10 +220,14 @@ def mail_responder(event, _):
         if file_data:
             feedback.send_email(CONFIG["REPLY_EMAIL"], source_email,
                                 CONFIG["EMAIL_SUBJECT"], text_body, html_body, file_name,
-                                file_data["Body"].read())
+                                file_data["Body"].read(),
+                                CONFIG["FEEDBACK_EMAIL"])
         else:
             feedback.send_email(CONFIG["REPLY_EMAIL"], source_email,
                                 CONFIG["EMAIL_SUBJECT"], text_body, html_body, file_name,
-                                None)
+                                None,
+                                CONFIG["FEEDBACK_EMAIL"])
     except ClientError as error:
         LOGGER.error("Error sending email: %s", str(error))
+
+    return True
