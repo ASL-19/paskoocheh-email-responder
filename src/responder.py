@@ -1,233 +1,477 @@
 """ Email Responder Lambda Function """
 
-import logging
-import os
-import boto3
 from botocore.exceptions import ClientError
-from pyskoocheh import actionlog, storage, feedback
-from pyskoocheh.errors import ValidationError
-import protobuf.schemas.python.paskoocheh_pb2 as paskoocheh
+from pyskoocheh import feedback
+from pyskoocheh.log import Log
+from helpers import (
+    write_to_db,
+    get_promo_code,
+    record_exist,
+    find_proxy,
+    update_ss_config,
+    get_attachment,
+    get_response_from_config,
+    parse_ses_notification,
+    reload_keys_signal,
+    hash_str)
 from settings import CONFIG
+from templates import TEMPLATES
+from outline_distribution.handler import OutlineHandler
+import urllib.parse as url_parse
+import time
 
-LANG = CONFIG["LANG"]
-LOGGER = logging.getLogger()
-LOGGER.setLevel(CONFIG["LOG_LEVEL"])
 
-def parse_ses_notification(ses_notification):
-    """ Gather incoming email info and validate
+logger = Log("EmailResponder", is_debug=CONFIG['IS_DEBUG'])
 
-    Args:
-        ses_notification: ses object from Lambda event
-    Returns:
-        source_email, recipient
-    """
-    if ses_notification["receipt"]["spamVerdict"]["status"] == "FAIL":
-        raise ValidationError("Email flagged as spam.")
-
-    if ses_notification["receipt"]["virusVerdict"]["status"] == "FAIL":
-        raise ValidationError("Email contains virus.")
-
-    source_email = ses_notification["mail"]["source"]
-    recipient = ses_notification["mail"]["destination"][0].lower()
-    return (source_email, recipient)
-
-def compose_start_html(pb_config):
-    """ Compose START_EMAIL html
-
-    Args:
-        pb_config: parsed Proto Buffer config file
-    Returns:
-        HTML to include in the response
-    """
-    html = u"<html>"
-    html += CONFIG["TEMPLATES"]["BIA_HTML"]["style"]
-    html += CONFIG["TEMPLATES"]["BIA_HTML"]["body_top"]
-
-    html += "<tr>"
-    html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_header"].format(platform_name = "Tools")
-
-    Tools = {}
-    for platform in pb_config.platforms:
-        if not platform.tools or len(platform.tools) == 0:
-            continue
-        html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_header"] \
-            .format(platform_name = paskoocheh.PlatformName.Name(platform.name).title())
-        platname = paskoocheh.PlatformName.Name(platform.name).title()
-        for tool in platform.tools:
-            if not tool.contact.name in Tools:
-                Tools[tool.contact.name] = {}
-            Tools[tool.contact.name][platname] = tool.contact.mail_responder_email
-    html += "</tr>"
-
-    for toolname, platforms in Tools.items():
-        html += "<tr>"
-        html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_first_column"] \
-                .format(tool_name = toolname)
-        for platform in pb_config.platforms:
-            if not platform.tools or len(platform.tools) == 0:
-                continue
-            platname = paskoocheh.PlatformName.Name(platform.name).title()
-            if platname in platforms:
-                toollink = CONFIG["TEMPLATES"]["BIA_HTML"]["table_tool_link"]. \
-                           format(tool_maillink = platforms[platname])
-            else:
-                toollink = ""
-            html += CONFIG["TEMPLATES"]["BIA_HTML"]["table_cell"] \
-                     .format(tool_link = toollink)
-        html += "</tr>"
-
-    html += CONFIG["TEMPLATES"]["BIA_HTML"]["body_bottom"]
-    return html
-
-def get_news_html():
-
-    try:
-        s3_resource = boto3.resource("s3")
-        email_body = s3_resource.Object(CONFIG["NEWS_BUCKET"], CONFIG["NEWS_FILENAME"]).get()['Body'].read()
-    except ClientError as error:
-        LOGGER.error("Error getting file to attach: %s", str(error))
-
-    return email_body
-
-def get_requested_file_config(recipient_email):
-    """ Get file requested from email destination
-
-    Args:
-        recipient_email: email address request was sent to
-    Returns:
-        matching configuration object from json file
-    """
-    pb_file = storage.get_binary_contents(CONFIG["CONF_S3_BUCKET"], CONFIG["CONF_S3_KEY"])
-    pb_config = paskoocheh.Config()
-    pb_config.ParseFromString(pb_file["Body"].read())
-
-    if recipient_email == CONFIG["START_EMAIL"]:
-        return {
-            "html": compose_start_html(pb_config)
-        }
-    elif recipient_email == CONFIG["REPLY_EMAIL"]:
-        return {}
-    elif recipient_email == CONFIG["NEWS_EMAIL"]:
-        return {
-            "html": get_news_html()
-        }
-
-    found_tool = None
-    for platform in pb_config.platforms:
-        for tool in platform.tools:
-            if tool.contact.mail_responder_email == recipient_email:
-                os_name = paskoocheh.PlatformName.Name(platform.name).title()
-                found_tool = tool
-    if not found_tool:
-        raise ValidationError("No matching email address found for request: {}"
-                              .format(recipient_email))
-
-    return {
-        "bucket": CONFIG["CONF_S3_BUCKET"],
-        "key": found_tool.releases[0].binary.path,
-        "file_name": os.path.basename(found_tool.releases[0].binary.path),
-        "release_url": found_tool.releases[0].release_url,
-        "tool_name": found_tool.contact.name + " - " + os_name
-    }
-
-def get_attachment(bucket, key, name, tool_name, link):
-    """ Validate and retrieve attachment file
-
-    Args:
-        bucket: s3 bucket where attachment resides
-        key: s3 key to attachment
-        name: filename to show in email
-    Returns:
-        text_body: templated text body of email
-        html_body: templated html body of email
-        file_data: contents of attachment file or None
-    """
-    attachment_template = CONFIG["TEMPLATES"]["ATTACHMENT_HTML"][LANG]
-    text_template = CONFIG["TEMPLATES"]["TEXT_BODY"][LANG]
-    html_template = CONFIG["TEMPLATES"]["HTML_BODY"][LANG]
-
-    attachment = None
-    if bucket and key:
-        attachment = storage.get_object_metadata(bucket, key[1:])
-
-    if not attachment:
-        text_body, html_body = feedback.template_email_link(text_template, html_template,
-                                                            attachment_template, link)
-        file_data = False
-    else:
-        if attachment.content_length < CONFIG["MAX_ATTACHMENT_SIZE"]:
-            # attach installer
-            try:
-                s3_resource = boto3.resource("s3")
-                file_data = s3_resource.Object(bucket, key[1:]).get()
-            except ClientError as error:
-                LOGGER.error("Error getting file to attach: %s", str(error))
-
-            if key[-4:] == ".exe":
-                text_template = CONFIG["TEMPLATES"]["WIN_TEXT_BODY"][LANG]
-                html_template = CONFIG["TEMPLATES"]["WIN_HTML_BODY"][LANG]
-
-            LOGGER.info("Sending file: %s", name)
-            text_body, html_body = feedback.template_email_link(text_template, html_template,
-                                                                attachment_template, None)
-        else:
-            s3_link = storage.get_temp_link(bucket, key[1:],
-                                         CONFIG["API_KEY_ID"], CONFIG["SECRET_KEY"])
-            s3_link = s3_link.replace("https://paskoocheh.s3.amazonaws.com/", "https://s3.amazonaws.com/paskoocheh/")
-            LOGGER.info("File is %s bytes, sending link.", attachment.content_length)
-            file_data = False
-            text_body, html_body = feedback.template_email_link(text_template, html_template,
-                                                                attachment_template, s3_link)
-    text_body = text_body.replace("{ tool name }", tool_name)
-    html_body = html_body.replace("{ tool name }", tool_name)
-
-    return (text_body, html_body, file_data)
 
 def mail_responder(event, _):
     """ Main entry point to handle the feedback form
         event: information about the email
         context: information about the context
     """
-    LOGGER.info("%s: Request received:%s", __name__, str(event["Records"][0]["eventSource"]))
+    logger.debug('%s: Request received:%s', __name__,
+                str(event['Records'][0]['eventSource']))
 
-    (source_email, recipient) = parse_ses_notification(event["Records"][0]["ses"])
+    LANG = CONFIG['LANG']
 
-    if recipient != CONFIG["START_EMAIL"] and recipient != CONFIG["NEWS_EMAIL"]:
-        if actionlog.is_limit_exceeded(source_email, recipient.split("@")[0]):
-            LOGGER.error("Rate limit exceeded for email:%s requested file:%s, Exiting",
-                         source_email, recipient.split("@")[0])
+    outline_new_name = "OUTLINE_NEW"
+    outline_exist_name = "OUTLINE_EXIST"
+
+    try:
+        (source_email, recipient, subject) = parse_ses_notification(
+            event['Records'][0]['ses'])
+    except Exception as e:
+        logger.error("error parsing the SES notification {}".format(e))
+        return False
+
+    if 'undisclosed-recipients' in recipient:
+        logger.error(
+            f"We've got an email to undisclosed-recipients "
+            f"Sender: {source_email} "
+            f"To: {recipient} "
+            f"Subject: {subject}")
+        return False
+
+    project = 'paskoocheh'
+    lb_type = True
+    if subject in CONFIG['OUTLINE_PROJECTS']:
+        project = CONFIG['OUTLINE_PROJECTS'][subject]
+        lb_type = False
+
+    if '@mada19.org' in recipient:
+        LANG = 'ar'
+        recipient = recipient.replace('mada19.org', 'paskoocheh.com')
+
+    if '@direme.xyz' in recipient:
+        recipient = recipient.replace('direme.xyz', 'paskoocheh.com')
+
+    if '@notofilter.dev' in recipient:
+        recipient = recipient.replace('notofilter.dev', 'paskoocheh.com')
+
+    reply_email = CONFIG['REPLY_EMAIL'][LANG]
+    email_subject = TEMPLATES['EMAIL_SUBJECT'][LANG]
+
+    if 'icd.community' in recipient:
+        LANG = 'en'
+        recipient = recipient.replace('icd.community', 'paskoocheh.com')
+        project = 'icd'
+        reply_email = 'no-reply@icd.community'
+        email_subject = TEMPLATES['ICD_EMAIL_SUBJECT'][LANG]
+        outline_new_name = "OUTLINE_ICD"
+        outline_exist_name = "OUTLINE_ICD"
+        lb_type = False
+
+    if 'paskoocheh.com' not in recipient:
+        logger.error(
+            f"An email to a wrong recipient address "
+            f"Sender: {source_email} "
+            f"To: {recipient} "
+            f"Subject: {subject}")
+        return False
+
+    logger.debug("Project is: {}".format(project))
+
+    logger.debug('Source Email {} recipient {}'.format(
+        source_email, recipient))
+
+    logger.debug('Start Email: {}'.format(CONFIG['START_EMAIL']))
+
+    if recipient == CONFIG['OUTLINE_EMAIL']:
+        if project == 'paskoocheh':
+            feedback.send_email(
+                reply_email,
+                source_email,
+                email_subject,
+                TEMPLATES['DEPRECATED_TEXT_BODY'][LANG],
+                TEMPLATES['DEPRECATED_HTML_BODY'][LANG],
+                '',
+                None,
+                CONFIG['FEEDBACK_EMAIL'])
+            return True
+        outline = OutlineHandler(None, project, add_prefix=True)
+        user_hash = hash_str(source_email)
+        try:
+            logger.debug(f'source_email: {user_hash}, project: {project}')
+            user_exist = outline.get_user(user_hash)
+        except Exception as e:
+            logger.error("error checking User's profile {}".format(e))
             return False
 
-    response = get_response_from_config(recipient)
+        if user_exist and user_exist.ss_config and lb_type:
+            logger.debug(f'user_exist: {user_exist.__json__}')
+            logger.debug(f'ss_config: {user_exist.ss_config}')
+            key_name = f"{user_exist.ss_config[0].file_name}.json"
+            ss_config_link = "ssconf://s3.amazonaws.com/{}/{}".format(CONFIG['S3_SSCONFIG_BUCKET_NAME'], key_name)
+            ss_config_aws_url = (CONFIG['OUTLINE_CONFIG_AWS_URL'] %
+                                    url_parse.quote(ss_config_link))
+            feedback.send_email(
+                reply_email,
+                source_email,
+                email_subject,
+                TEMPLATES[f'{outline_exist_name}_TEXT_BODY'][LANG].
+                format(f"{ss_config_aws_url}#{project}"),
+                TEMPLATES[f'{outline_exist_name}_HTML_BODY'][LANG].
+                format(f"{ss_config_aws_url}#{project}", f"{ss_config_aws_url}#{project}"),
+                '',
+                None,
+                CONFIG['FEEDBACK_EMAIL'])
+            return True
+
+        # Legacy distribution system for the sponsored projects
+        elif user_exist and not lb_type:
+            ss_link, ssconfig_name, ss_prefix = outline.get_sslink(
+                user_hash,
+                "blocked",
+                1)
+            if ss_link is None:
+                feedback.send_email(
+                    reply_email,
+                    source_email,
+                    email_subject,
+                    TEMPLATES['NOSERVER_TEXT_BODY'][LANG],
+                    TEMPLATES['NOSERVER_HTML_BODY'][LANG],
+                    '',
+                    None,
+                    CONFIG['FEEDBACK_EMAIL'])
+                return True
+
+            try:
+                ssconfig_link = update_ss_config(ssconfig_name, ss_link)
+                ss_config_aws_url = (CONFIG['OUTLINE_CONFIG_AWS_URL'] %
+                        url_parse.quote(ssconfig_link))
+            except Exception as e:
+                logger.error(f"Unable to prepare ss_config_aws_url: {e}")
+                feedback.send_email(
+                    reply_email,
+                    source_email,
+                    email_subject,
+                    TEMPLATES['NOSERVER_TEXT_BODY'][LANG],
+                    TEMPLATES['NOSERVER_HTML_BODY'][LANG],
+                    '',
+                    None,
+                    CONFIG['FEEDBACK_EMAIL'])
+                return False
+
+            feedback.send_email(
+                reply_email,
+                source_email,
+                email_subject,
+                TEMPLATES[f'{outline_exist_name}_TEXT_BODY'][LANG].
+                format(f"{ss_config_aws_url}#{project}"),
+                TEMPLATES[f'{outline_exist_name}_HTML_BODY'][LANG].
+                format(f"{ss_config_aws_url}#{project}", f"{ss_config_aws_url}#{project}"),
+                '',
+                None,
+                CONFIG['FEEDBACK_EMAIL'])
+            return True
+
+        else:
+            logger.debug(f'Creating a user profile for: {user_hash}')
+            ss_link, ssconfig_name, ss_prefix = outline.create_user(user_hash)
+            if ss_link is None:
+                logger.debug(f'No Outline key for: {user_hash}')
+                feedback.send_email(
+                    reply_email,
+                    source_email,
+                    email_subject,
+                    TEMPLATES['NOSERVER_TEXT_BODY'][LANG],
+                    TEMPLATES['NOSERVER_HTML_BODY'][LANG],
+                    '',
+                    None,
+                    CONFIG['FEEDBACK_EMAIL'])
+                return True
+
+            try:
+                ssconfig_link = update_ss_config(ssconfig_name, ss_link, ss_prefix)
+                ss_config_aws_url = (CONFIG['OUTLINE_CONFIG_AWS_URL'] %
+                        url_parse.quote(ssconfig_link))
+            except Exception as e:
+                logger.error(f"Unable to prepare ss_config_aws_url: {e}")
+                feedback.send_email(
+                    reply_email,
+                    source_email,
+                    email_subject,
+                    TEMPLATES['NOSERVER_TEXT_BODY'][LANG],
+                    TEMPLATES['NOSERVER_HTML_BODY'][LANG],
+                    '',
+                    None,
+                    CONFIG['FEEDBACK_EMAIL'])
+                return False
+
+            # Wait for Outline servers in the pool to reload their keys
+            # ToDo: Find a better way to ensure all servers have reloaded their keys
+            time.sleep(3)
+
+            fname = TEMPLATES['OUTLINE_GUIDELINE_PHOTO'][LANG]
+            with open(fname, "rb") as image_file:
+                feedback.send_email(
+                    reply_email,
+                    source_email,
+                    email_subject,
+                    TEMPLATES[f'{outline_new_name}_TEXT_BODY'][LANG].
+                    format(f"{ss_config_aws_url}#{project}"),
+                    TEMPLATES[f'{outline_new_name}_HTML_BODY'][LANG].
+                    format(f"{ss_config_aws_url}#{project}", f"{ss_config_aws_url}#{project}"),
+                    fname,
+                    image_file.read(),
+                    CONFIG['FEEDBACK_EMAIL'])
+            return True
+        return True
+
+    elif recipient == CONFIG['SOS_EMAIL']:
+        with open(CONFIG['SOS_FILE'], "rb") as pdf_file:
+            feedback.send_email(
+                reply_email,
+                source_email,
+                email_subject,
+                TEMPLATES['SOS_TEXT_BODY'][LANG],
+                TEMPLATES['SOS_HTML_BODY'][LANG],
+                CONFIG['SOS_FILE'],
+                pdf_file.read(),
+                CONFIG['FEEDBACK_EMAIL'])
+        return True
+
+    elif recipient in ['testme@notofilter.dev', 'testme@paskoocheh.com']:
+        logger.debug('Responding to the test email.')
+        feedback.send_email(
+            reply_email,
+            source_email,
+            email_subject,
+            'a',
+            'a',
+            '',
+            None, CONFIG['FEEDBACK_EMAIL'])
+        return True
+
+    elif recipient == CONFIG['TG_PROXY_EMAIL']:
+        proxy_tg = find_proxy(source_email, filename=CONFIG['MTPROTO_PROXY_FILE'])
+
+        response = {
+            'bucket': None,
+            'key': None,
+            'file_name': None,
+            'release_url': None,
+            'tool_name': 'telegram-proxy',
+            'tool': 'telegram-proxy',
+            'os': None,
+            'version': None,
+            'size': None,
+            'tool_id': None,
+        }
+
+        try:
+            write_to_db(recipient, 'url', response, LANG)
+        except Exception as e:
+            logger.error("error writing Telegram Proxy to DB {}".format(e))
+            return False
+
+        feedback.send_email(
+            reply_email, source_email,
+            email_subject,
+            TEMPLATES['PROXY_TEXT_BODY'][LANG].format(proxy_tg),
+            TEMPLATES['PROXY_HTML_BODY'][LANG].format(proxy_tg, proxy_tg),
+            '',
+            None,
+            CONFIG['FEEDBACK_EMAIL'])
+        return True
+
+    # Promo Code
+    elif recipient in CONFIG['PROMO_CODE_RECIPIENTS']:
+        # response = get_response_from_config(recipient, LANG)
+
+        # response = {
+        #     'bucket': None,
+        #     'key': None,
+        #     'file_name': None,
+        #     'release_url': None,
+        #     'tool_name': 'mullvad-android',
+        #     'tool': 'mullvad-android',
+        #     'app': 'gershad',
+        #     'os': 'android',
+        #     'version': None,
+        #     'size': None,
+        #     'tool_id': None,
+        # }
+
+        values = {
+            'user_uuid': str(recipient),
+            # 'tool': response['tool'],
+            # 'app': response['app'],
+            'channel': CONFIG['APPLICATION_SOURCE'][LANG],
+            # 'platform': response['os'],
+            'tool_version': None,
+            'platform_version': None,
+            'download_time': None,
+            'downloaded_via': 'email',
+            'country': None,
+            'city': None,
+            'network_type': None,
+            'file_size': None,
+            'network_name': None,
+            'channel_version': CONFIG['VERSION'],
+            'network_country': None,
+            'timezone': None,
+            'tool_id': None
+        }
+
+        tool_name = recipient.split("@")[0]
+        print(tool_name)
+
+        values['tool'] = tool_name
+        values['app'] = tool_name.split("-")[0]
+        values['platform'] = tool_name.split("-")[1]
+
+        try:
+            if record_exist(
+                    source_email,
+                    values['app'],
+                    values['platform'],
+                    'EMAIL_RESPONDER',
+                    'promocode'):
+                logger.debug("User already got the promo code.")
+                return True
+            else:
+                print("User did not get the promo code.")
+                code, guide_link = get_promo_code(values, source_email)
+                print("after get_promo_code")
+                if code:
+                    feedback.send_email(
+                        reply_email,
+                        source_email,
+                        email_subject,
+                        TEMPLATES['MULLVAD_TEXT_BODY'][LANG].
+                        format(
+                            code,
+                            values['app'],
+                            CONFIG["PROMO_CODE_EXPIRY_DATE"],
+                            guide_link,
+                            guide_link),
+                        TEMPLATES['MULLVAD_HTML_BODY'][LANG].
+                        format(
+                            code,
+                            values['app'],
+                            CONFIG["PROMO_CODE_EXPIRY_DATE"],
+                            guide_link,
+                            guide_link),
+                        '',
+                        '',
+                        CONFIG['FEEDBACK_EMAIL'])
+            # return True
+
+            #save_chat_state_none(tmsg.user_id, tmsg.chat_id, tmsg.user_info)
+        except Exception as e:
+            logger.error("error checking for record in db {}".format(e))
+            return False
+
+    elif recipient == reply_email:
+        logger.info('Response to no-reply ignored')
+        return True
+
+    try:
+        response = get_response_from_config(recipient, LANG)
+    except Exception as e:
+        logger.error("error preparing the response {}".format(e))
+        return False
 
     # special case for bia@ address
     if not response:
         # no file available, error
-        LOGGER.error("No attachment defined in configuration file")
+        logger.error('No attachment defined in configuration file')
         return False
+    elif 'html' in response:
+        feedback.send_email(
+            reply_email,
+            source_email,
+            email_subject,
+            TEMPLATES['BIA_TEXT'][LANG],
+            response['html'], '',
+            None,
+            CONFIG['FEEDBACK_EMAIL'])
+        return True
+
+    elif 'apk_issue' in response:
+        logger.debug('User asked for an android app, responding with Paskoocheh app instead.')
+        try:
+            response = get_response_from_config("paskoocheh-android@paskoocheh.com", LANG)
+            file_bucket = response['bucket']
+            file_key = response['key']
+            file_name = response['file_name']
+            release_url = response['release_url']
+            tool_name = response['tool_name']
+            text_template_name = 'APK_ISSUE_TEXT_BODY'
+            html_template_name = 'APK_ISSUE_HTML_BODY'
+            attachment_template_name = 'ATTACHMENT_HTML_PASKOOCHEH'
+        except Exception as e:
+            logger.error("error getting the attachment {}".format(e))
+            return False
+
     else:
-        file_bucket = response["bucket"]
-        file_key = response["key"]
-        file_name = response["file_name"]
-        release_url = response["release_url"]
-        tool_name = response["tool_name"]
+        file_bucket = response['bucket']
+        file_key = response['key']
+        file_name = response['file_name']
+        release_url = response['release_url']
+        tool_name = response['tool_name']
+        text_template_name = 'TEXT_BODY'
+        html_template_name = 'HTML_BODY'
+        attachment_template_name = 'ATTACHMENT_HTML'
 
-    (text_body, html_body, file_data) = get_attachment(file_bucket, file_key, file_name, tool_name, release_url)
+    try:
+        (text_body, html_body, file_data) = get_attachment(
+            bucket=file_bucket, key=file_key, name=file_name, tool_name=tool_name, link=release_url, lang=LANG,
+            text_template_name=text_template_name, html_template_name=html_template_name, attachment_template_name=attachment_template_name)
+    except Exception as e:
+        logger.error("error getting the attachment {}".format(e))
+        return False
 
-    # store request in dynamodb and send email
-    actionlog.log_action(source_email, recipient.split("@")[0], CONFIG["SOURCE_APP"])
+    try:
+        write_to_db(recipient, 's3' if file_data else 'url', response, LANG)
+    except Exception as e:
+        logger.error("error writing to DB {}".format(e))
+        return False
+
     try:
         if file_data:
-            feedback.send_email(CONFIG["REPLY_EMAIL"], source_email,
-                                CONFIG["EMAIL_SUBJECT"], text_body, html_body, file_name,
-                                file_data["Body"].read(),
-                                CONFIG["FEEDBACK_EMAIL"])
+            feedback.send_email(
+                reply_email,
+                source_email,
+                email_subject,
+                text_body,
+                html_body,
+                file_name,
+                file_data['Body'].read(),
+                CONFIG['FEEDBACK_EMAIL'])
         else:
-            feedback.send_email(CONFIG["REPLY_EMAIL"], source_email,
-                                CONFIG["EMAIL_SUBJECT"], text_body, html_body, file_name,
-                                None,
-                                CONFIG["FEEDBACK_EMAIL"])
+            feedback.send_email(
+                reply_email,
+                source_email,
+                email_subject,
+                text_body,
+                html_body,
+                file_name,
+                None,
+                CONFIG['FEEDBACK_EMAIL'])
     except ClientError as error:
-        LOGGER.error("Error sending email: %s", str(error))
+        logger.error('Error sending email: %s', str(error))
+        return False
 
     return True

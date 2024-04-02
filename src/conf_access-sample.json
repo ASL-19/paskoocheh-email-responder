@@ -1,0 +1,44 @@
+{
+    "LIMITED_ACCESS": {
+        "API_KEY_ID": "$API_KEY_ID_LIMITED",
+        "SECRET_KEY": "$SECRET_KEY_LIMITED"
+
+    },
+    "PROMO_ACCESS": {
+        "ACCESS_KEY": "$ACCESS_KEY_PROMO",
+        "SECRET_KEY": "$SECRET_KEY_PROMO"
+    },
+    "PROXY_ACCESS": {
+        "ACCESS_KEY": "$ACCESS_KEY_PROXY",
+        "SECRET_KEY": "$SECRET_KEY_PROXY"
+    },
+    "SSCONFIG_ACCESS": {
+        "ACCESS_KEY": "$SSCONFIG_ACCESS_KEY",
+        "SECRET_KEY": "$SSCONFIG_SECRET_KEY"
+    },
+    "STATS_DB": {
+        "HOST": "$DB_HOST_STATS",
+        "PORT": "$DB_PORT_STATS",
+        "USER": "$DB_USER_STATS",
+        "PASSWORD": "$DB_PASSWORD_STATS",
+        "DB_NAME": "$DB_NAME_STATS",
+        "TIMEOUT": "$DB_TIMEOUT_STATS"
+    },
+    "TELEGRAM_DB": {
+        "HOST": "$DB_HOST_TELEGRAM",
+        "PORT": "$DB_PORT_TELEGRAM",
+        "USER": "$DB_USER_TELEGRAM",
+        "PASSWORD": "$DB_PASSWORD_TELEGRAM",
+        "DB_NAME": "$DB_NAME_TELEGRAM",
+        "TIMEOUT": "$DB_TIMEOUT_TELEGRAM"
+    },
+    "OUTLINE_DB": {
+        "HOST": "$DB_HOST_OUTLINE",
+        "PORT": "$DB_PORT_OUTLINE",
+        "USER": "$DB_USER_OUTLINE",
+        "PASSWORD": "$DB_PASSWORD_OUTLINE",
+        "DB_NAME": "$DB_NAME_OUTLINE",
+        "TIMEOUT": "$DB_TIMEOUT_OUTLINE"
+    }
+}
+
