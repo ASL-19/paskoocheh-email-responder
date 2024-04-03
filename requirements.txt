@@ -1,3 +1,10 @@
-requests
-protobuf
-https://github.com/ASL-19/pyskoocheh.git
+urllib3==1.26.15
+itsdangerous==2.0.1
+jdatetime==4.1.1
+protobuf==4.22.1
+PyMySQL==1.0.2
+requests==2.29.0
+setuptools==67.6.0
+six==1.16.0
+SQLAlchemy==2.0.12
+outline-api
